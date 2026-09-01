@@ -209,13 +209,6 @@ def build_pca_matrix(
     return pca_matrix, direction, mean_example_activations, mean_counter_activations
 
 
-def compare_act(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    cosine_distance = 1 - F.cosine_similarity(x, y, dim=-1)
-    euclidean_distance = torch.linalg.vector_norm(x - y, dim=-1)
-
-    return cosine_distance, euclidean_distance
-
-
 @app.local_entrypoint()
 def main(seed: int = 42) -> None:
     pca_matrix, direction, positive_activations, negative_activations = (
@@ -227,7 +220,6 @@ def main(seed: int = 42) -> None:
     print(f"First principal direction shape: {tuple(direction.shape)}")
 
     print("Checking activations")
-    torch.save(positive_activations, DATA_DIR / "pos_act.pt")
-    torch.save(negative_activations, DATA_DIR / "neg_act.pt")
+    torch.save(positive_activations, DATA_DIR / "difference_in_means" / "pos_act.pt")
+    torch.save(negative_activations, DATA_DIR / "difference_in_means" / "neg_act.pt")
     print(positive_activations.size(), negative_activations.size())
-    print(compare_act(positive_activations, negative_activations))
