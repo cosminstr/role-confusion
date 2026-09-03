@@ -37,6 +37,11 @@ x = torch.load(DATA_DIR / "difference_in_means" / "pos_act.pt").float()
 
 y = torch.load(DATA_DIR / "difference_in_means" / "neg_act.pt").float()
 
+if x.ndim == 2:
+    x = x.unsqueeze(0)  # [1, layers, hidden]
+if y.ndim == 2:
+    y = y.unsqueeze(0)  # [1, layers, hidden]
+
 print("=" * 80)
 print("ACTIVATION SHAPES")
 print("=" * 80)
@@ -79,7 +84,7 @@ def print_summary(name, values):
     print(f"\n{name}")
     print("-" * 80)
     print(f"mean:   {values.mean().item():.6f}")
-    print(f"std:    {values.std().item():.6f}")
+    print(f"std:    {values.std(correction=0).item():.6f}")
     print(f"median: {values.median().item():.6f}")
     print(f"min:    {values.min().item():.6f}")
     print(f"max:    {values.max().item():.6f}")
@@ -138,13 +143,13 @@ for layer in range(num_layers):
     yn = y_norm[:, layer]
 
     cos_mean = cos.mean().item()
-    cos_std = cos.std().item()
+    cos_std = cos.std(correction=0).item()
 
     euc_mean = euc.mean().item()
-    euc_std = euc.std().item()
+    euc_std = euc.std(correction=0).item()
 
     neuc_mean = neuc.mean().item()
-    neuc_std = neuc.std().item()
+    neuc_std = neuc.std(correction=0).item()
 
     xn_mean = xn.mean().item()
     yn_mean = yn.mean().item()
@@ -406,3 +411,63 @@ print(
     f"{torch.argmax(token_neuc_mean).item()} "
     f"(distance={token_neuc_mean.max().item():.6f})"
 )
+
+print("\n")
+print("=" * 100)
+print("MOST CHANGED TOKEN AT EACH LAYER")
+print("=" * 100)
+
+for layer in range(num_layers):
+    cos_values = cosine_similarity[:, layer]
+    euc_values = euclidean_distance[:, layer]
+    neuc_values = normalized_euclidean[:, layer]
+
+    cos_token = torch.argmin(cos_values)
+    euc_token = torch.argmax(euc_values)
+    neuc_token = torch.argmax(neuc_values)
+
+    print(
+        f"Layer {layer:2d} | "
+        f"cosine: token {cos_token.item():3d} "
+        f"({cos_values[cos_token].item():.4f}) | "
+        f"euclidean: token {euc_token.item():3d} "
+        f"({euc_values[euc_token].item():.2f}) | "
+        f"norm-euc: token {neuc_token.item():3d} "
+        f"({neuc_values[neuc_token].item():.4f})"
+    )
+
+token = 0
+
+plt.figure(figsize=(10, 5))
+
+plt.plot(
+    layers,
+    cosine_similarity[token].detach().cpu(),
+    marker="o",
+)
+
+plt.xlabel("Layer")
+plt.ylabel("Cosine similarity")
+plt.title(f"Token {token}: Cosine Similarity Across Layers")
+plt.xticks(layers)
+plt.grid(alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(10, 5))
+
+plt.plot(
+    layers,
+    normalized_euclidean[token].detach().cpu(),
+    marker="o",
+)
+
+plt.xlabel("Layer")
+plt.ylabel("Normalized Euclidean distance")
+plt.title(f"Token {token}: Normalized Distance Across Layers")
+plt.xticks(layers)
+plt.grid(alpha=0.3)
+
+plt.tight_layout()
+plt.show()

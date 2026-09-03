@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from pathlib import Path
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
+from utils import normalize_candidate_directions, split_prompt_indices
 
 
 def set_seed(seed: int = 42) -> None:
@@ -23,7 +24,7 @@ def set_seed(seed: int = 42) -> None:
 
 MODEL_NAME = "openai/gpt-oss-20b"
 BATCH_SIZE = 32
-LAYERS_TO_PROBE = list(range(24))
+LAYERS_TO_PROBE = list(range(7, 18, 1))
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 REMOTE_DATA_DIR = Path("/data")
@@ -56,38 +57,32 @@ image = (
         DATA_DIR / "counter_examples.pt",
         str(REMOTE_DATA_DIR / "counter_examples.pt"),
     )
+    .add_local_python_source("utils")
 )
 
 
-def compute_pca(matrix: torch.Tensor) -> torch.Tensor:
-    float_matrix = matrix.to(dtype=torch.float32)
-    _, _, components = torch.linalg.svd(float_matrix, full_matrices=False)
+def compute_dominant_direction(matrix: torch.Tensor) -> torch.Tensor:
+    normalized_directions = normalize_candidate_directions(matrix)
+    _, _, components = torch.linalg.svd(normalized_directions, full_matrices=False)
     direction = components[0]  # [hidden]
-    reference = float_matrix.mean(dim=0)  # [hidden]
+    reference = normalized_directions.mean(dim=0)  # [hidden]
     if torch.dot(direction, reference) < 0:
         direction = -direction
     return direction
 
 
-def get_content_positions(
+def get_first_content_positions(
     example_input_ids: torch.Tensor,
     example_attention_mask: torch.Tensor,
     counter_input_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     content_length = counter_input_ids.size(-1)
     example_windows = example_input_ids.unfold(-1, content_length, 1)
     mask_windows = example_attention_mask.unfold(-1, content_length, 1)
     matches = (example_windows == counter_input_ids[:, None, None]).all(
         dim=-1
     ) & mask_windows.bool().all(dim=-1)  # [batch, roles, windows]
-    content_starts = matches.to(dtype=torch.long).argmax(dim=-1)  # [batch, roles]
-    counter_positions = torch.arange(content_length).expand(
-        counter_input_ids.size(0), -1
-    )  # [batch, tokens]
-    example_positions = (
-        content_starts[:, :, None] + counter_positions[:, None]
-    )  # [batch, roles, tokens]
-    return example_positions, counter_positions
+    return matches.to(dtype=torch.long).argmax(dim=-1)  # [batch, roles]
 
 
 def cache_layer_inputs(
@@ -96,7 +91,7 @@ def cache_layer_inputs(
     attention_mask: torch.Tensor,
     token_positions: torch.Tensor,
 ) -> torch.Tensor:
-    batch_positions = torch.arange(input_ids.size(0))[:, None]
+    batch_positions = torch.arange(input_ids.size(0))
     saved_activations = []
     with model.trace(
         {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -110,28 +105,29 @@ def cache_layer_inputs(
                 ]
                 .float()
                 .save()
-            )  # [batch, tokens, hidden]
+            )  # [batch, hidden]
             saved_activations.append(activation)
         tracer.stop()
 
     return (
-        torch.stack(saved_activations, dim=2).detach().cpu()
-    )  # [batch, tokens, layers, hidden]
+        torch.stack(saved_activations, dim=1).detach().cpu()
+    )  # [batch, layers, hidden]
 
 
-def load_dataloader() -> DataLoader:
+def load_dataloader(seed: int) -> tuple[DataLoader, torch.Tensor]:
     examples = torch.load(REMOTE_DATA_DIR / "examples.pt", map_location="cpu")
     counter_examples = torch.load(
         REMOTE_DATA_DIR / "counter_examples.pt",
         map_location="cpu",
     )
+    train_indices, _ = split_prompt_indices(examples["input_ids"].size(0), seed)
     dataset = TensorDataset(
-        examples["input_ids"],
-        examples["attention_mask"],
-        counter_examples["input_ids"],
-        counter_examples["attention_mask"],
+        examples["input_ids"][train_indices],
+        examples["attention_mask"][train_indices],
+        counter_examples["input_ids"][train_indices],
+        counter_examples["attention_mask"][train_indices],
     )
-    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False), train_indices
 
 
 @app.function(
@@ -143,7 +139,7 @@ def load_dataloader() -> DataLoader:
 )
 def build_pca_matrix(
     seed: int = 42,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     set_seed(seed)
     model = nnsight.LanguageModel(
         MODEL_NAME,
@@ -155,7 +151,7 @@ def build_pca_matrix(
     model.set_experts_implementation("eager")  # for reproductibility
     model.eval()
     model.config.use_cache = False
-    dataloader = load_dataloader()
+    dataloader, train_indices = load_dataloader(seed)
     example_activation_sum = None
     counter_activation_sum = None
     example_prompt_count = 0
@@ -163,25 +159,24 @@ def build_pca_matrix(
 
     for batch in tqdm(dataloader, desc="Caching activations"):
         (
-            example_input_ids,
+            example_input_ids,  # [batch, roles, tagged_length]
             example_attention_mask,
-            counter_input_ids,
+            counter_input_ids,  # [batch, content_length]
             counter_attention_mask,
         ) = batch
-        example_positions, counter_positions = get_content_positions(
+        example_positions = get_first_content_positions(
             example_input_ids,
             example_attention_mask,
             counter_input_ids,
         )
+        counter_positions = torch.zeros_like(counter_input_ids[:, 0])  # [batch]
         counter_batch_activations = cache_layer_inputs(
             model,
             counter_input_ids,
             counter_attention_mask,
             counter_positions,
-        )  # [batch, tokens, layers, hidden]
-        counter_batch_sum = counter_batch_activations.sum(
-            dim=0
-        )  # [tokens, layers, hidden]
+        )  # [batch, layers, hidden]
+        counter_batch_sum = counter_batch_activations.sum(dim=0)  # [layers, hidden]
         if counter_activation_sum is None:
             counter_activation_sum = torch.zeros_like(counter_batch_sum)
             example_activation_sum = torch.zeros_like(counter_batch_sum)
@@ -193,7 +188,7 @@ def build_pca_matrix(
                 example_input_ids[:, role_index],
                 example_attention_mask[:, role_index],
                 example_positions[:, role_index],
-            )  # [batch, tokens, layers, hidden]
+            )  # [batch, layers, hidden]
             example_activation_sum += example_batch_activations.sum(dim=0)
 
         counter_prompt_count += counter_input_ids.size(0)
@@ -201,25 +196,34 @@ def build_pca_matrix(
 
     mean_example_activations = example_activation_sum / example_prompt_count
     mean_counter_activations = counter_activation_sum / counter_prompt_count
-    pca_matrix = (mean_example_activations - mean_counter_activations).flatten(
-        0, 1
-    )  # [tokens * layers, hidden]
-    direction = compute_pca(pca_matrix.cuda()).cpu()  # [hidden]
+    pca_matrix = mean_example_activations - mean_counter_activations  # [layers, hidden]
+    direction = compute_dominant_direction(pca_matrix.cuda()).cpu()  # [hidden]
     volume.commit()
-    return pca_matrix, direction, mean_example_activations, mean_counter_activations
+    return (
+        pca_matrix,
+        direction,
+        mean_example_activations,
+        mean_counter_activations,
+        train_indices,
+    )
 
 
 @app.local_entrypoint()
 def main(seed: int = 42) -> None:
-    pca_matrix, direction, positive_activations, negative_activations = (
+    pca_matrix, direction, positive_activations, negative_activations, train_indices = (
         build_pca_matrix.remote(seed)
     )
-    output_path = DATA_DIR / "pca_matrix.pt"
+    output_path = DATA_DIR / "L7_17" / "pca_matrix.pt"
     torch.save(pca_matrix, output_path)
-    print(f"Saved PCA matrix with shape {tuple(pca_matrix.shape)} to {output_path}")
-    print(f"First principal direction shape: {tuple(direction.shape)}")
+    direction_path = DATA_DIR / "L7_17" / "dominant_direction.pt"
+    torch.save(direction, direction_path)
+    train_indices_path = DATA_DIR / "L7_17" / "train_indices.pt"
+    torch.save(train_indices, train_indices_path)
+    print(f"Saved candidate direction matrix with shape {tuple(pca_matrix.shape)} to {output_path}")
+    print(f"Saved dominant direction with shape {tuple(direction.shape)} to {direction_path}")
+    print(f"Saved {train_indices.numel()} direction-training indices to {train_indices_path}")
 
     print("Checking activations")
-    torch.save(positive_activations, DATA_DIR / "difference_in_means" / "pos_act.pt")
-    torch.save(negative_activations, DATA_DIR / "difference_in_means" / "neg_act.pt")
+    torch.save(positive_activations, DATA_DIR / "L7_17" / "pos_act.pt")
+    torch.save(negative_activations, DATA_DIR / "L7_17" / "neg_act.pt")
     print(positive_activations.size(), negative_activations.size())
