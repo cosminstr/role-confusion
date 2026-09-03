@@ -1,25 +1,18 @@
+from pathlib import Path
+
 import modal
 import nnsight
 import torch
-
-import torch.nn.functional as F
-from pathlib import Path
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
-from utils import normalize_candidate_directions, split_prompt_indices
-
-
-def set_seed(seed: int = 42) -> None:
-    print("setting seed")
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        print("setting gpu seeds")
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-    print("finished setting seeds")
+from utils import (
+    cache_layer_inputs,
+    get_first_content_positions,
+    load_aligned_dataset,
+    normalize_candidate_directions,
+    set_seed,
+    split_prompt_indices,
+)
 
 
 MODEL_NAME = "openai/gpt-oss-20b"
@@ -71,63 +64,14 @@ def compute_dominant_direction(matrix: torch.Tensor) -> torch.Tensor:
     return direction
 
 
-def get_first_content_positions(
-    example_input_ids: torch.Tensor,
-    example_attention_mask: torch.Tensor,
-    counter_input_ids: torch.Tensor,
-) -> torch.Tensor:
-    content_length = counter_input_ids.size(-1)
-    example_windows = example_input_ids.unfold(-1, content_length, 1)
-    mask_windows = example_attention_mask.unfold(-1, content_length, 1)
-    matches = (example_windows == counter_input_ids[:, None, None]).all(
-        dim=-1
-    ) & mask_windows.bool().all(dim=-1)  # [batch, roles, windows]
-    return matches.to(dtype=torch.long).argmax(dim=-1)  # [batch, roles]
-
-
-def cache_layer_inputs(
-    model: nnsight.LanguageModel,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    token_positions: torch.Tensor,
-) -> torch.Tensor:
-    batch_positions = torch.arange(input_ids.size(0))
-    saved_activations = []
-    with model.trace(
-        {"input_ids": input_ids, "attention_mask": attention_mask}
-    ) as tracer:
-        for layer_index in LAYERS_TO_PROBE:
-            activation = (
-                model.model.layers[layer_index]
-                .input[
-                    batch_positions,
-                    token_positions,
-                ]
-                .float()
-                .save()
-            )  # [batch, hidden]
-            saved_activations.append(activation)
-        tracer.stop()
-
-    return (
-        torch.stack(saved_activations, dim=1).detach().cpu()
-    )  # [batch, layers, hidden]
-
-
 def load_dataloader(seed: int) -> tuple[DataLoader, torch.Tensor]:
-    examples = torch.load(REMOTE_DATA_DIR / "examples.pt", map_location="cpu")
-    counter_examples = torch.load(
-        REMOTE_DATA_DIR / "counter_examples.pt",
-        map_location="cpu",
+    dataset = load_aligned_dataset(REMOTE_DATA_DIR)
+    train_indices, _ = split_prompt_indices(len(dataset), seed)
+    train_dataset = Subset(dataset, train_indices.tolist())
+    return (
+        DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False),
+        train_indices,
     )
-    train_indices, _ = split_prompt_indices(examples["input_ids"].size(0), seed)
-    dataset = TensorDataset(
-        examples["input_ids"][train_indices],
-        examples["attention_mask"][train_indices],
-        counter_examples["input_ids"][train_indices],
-        counter_examples["attention_mask"][train_indices],
-    )
-    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False), train_indices
 
 
 @app.function(
@@ -175,6 +119,7 @@ def build_pca_matrix(
             counter_input_ids,
             counter_attention_mask,
             counter_positions,
+            LAYERS_TO_PROBE,
         )  # [batch, layers, hidden]
         counter_batch_sum = counter_batch_activations.sum(dim=0)  # [layers, hidden]
         if counter_activation_sum is None:
@@ -188,6 +133,7 @@ def build_pca_matrix(
                 example_input_ids[:, role_index],
                 example_attention_mask[:, role_index],
                 example_positions[:, role_index],
+                LAYERS_TO_PROBE,
             )  # [batch, layers, hidden]
             example_activation_sum += example_batch_activations.sum(dim=0)
 

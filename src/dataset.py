@@ -5,9 +5,9 @@ import torch
 from datasets import IterableDataset, load_dataset
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer
+from utils import ROLES
 
 
-ROLES = ("system", "developer", "user", "cot", "assistant", "tool")
 N_SAMPLES = 256
 MAX_SEQ_LEN = 512
 
