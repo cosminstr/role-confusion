@@ -7,9 +7,6 @@ get_first_content_positions: Finds where the shared content starts in each tagge
 cache_layer_inputs: Caches layer input activations at selected token positions.
 normalize_candidate_directions: Normalizes each row of the candidate-direction matrix.
 split_prompt_indices: Splits shuffled prompt indices into training and held-out sets.
-project_onto_direction: Projects vectors onto a normalized direction.
-plot_role_tag_projections: Plots tagged and untagged projections and their differences.
-main: Computes the dominant direction from saved data and saves and shows the projection plot.
 """
 
 from __future__ import annotations
@@ -23,13 +20,9 @@ import torch.nn.functional as F
 from torch.utils.data import TensorDataset
 
 if TYPE_CHECKING:
-    from matplotlib.axes import Axes
-    from matplotlib.figure import Figure
     from nnsight import LanguageModel
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ACTIVATION_DIR = PROJECT_ROOT / "data" / "L7_17"
 ROLES = ("system", "developer", "user", "cot", "assistant", "tool")
 
 
@@ -87,18 +80,19 @@ def cache_layer_inputs(
         {"input_ids": input_ids, "attention_mask": attention_mask}
     ) as tracer:
         for layer_index in layer_indices:
-            activation = (
-                model.model.layers[layer_index]
-                .input[batch_positions, token_positions]
-                .float()
-                .save()
-            )  # [batch, hidden]
-            saved_activations.append(activation)
+            layer = model.model.layers[layer_index]
+            layer_input = layer.input  # [batch, sequence, hidden]
+            selected_tokens = layer_input[
+                batch_positions, token_positions
+            ]  # [batch, hidden]
+            activation = selected_tokens.float()  # [batch, hidden]
+            saved_activation = activation.save()
+            saved_activations.append(saved_activation)
         tracer.stop()
 
-    return (
-        torch.stack(saved_activations, dim=1).detach().cpu()
-    )  # [batch, layers, hidden]
+    activations = torch.stack(saved_activations, dim=1)  # [batch, layers, hidden]
+    activations = activations.detach()
+    return activations.cpu()
 
 
 def normalize_candidate_directions(matrix: torch.Tensor) -> torch.Tensor:
@@ -115,84 +109,3 @@ def split_prompt_indices(
     permutation = torch.randperm(n_samples, generator=generator)
     split = int(train_fraction * n_samples)
     return permutation[:split], permutation[split:]
-
-
-############################
-# Used only in this script #
-############################
-
-
-def project_onto_direction(
-    vectors: torch.Tensor,
-    direction: torch.Tensor,
-) -> torch.Tensor:
-    unit_direction = F.normalize(direction.float(), dim=0)  # [hidden]
-    return vectors.float() @ unit_direction  # [...]
-
-
-def plot_role_tag_projections(
-    tagged_vectors: torch.Tensor,
-    no_tag_vectors: torch.Tensor,
-    direction: torch.Tensor,
-    layer_indices: Sequence[int] | None = None,
-) -> tuple[Figure, tuple[Axes, Axes]]:
-    import matplotlib.pyplot as plt
-
-    tagged_scores = project_onto_direction(tagged_vectors, direction).cpu()
-    no_tag_scores = project_onto_direction(no_tag_vectors, direction).cpu()
-    margins = tagged_scores - no_tag_scores  # [layers]
-
-    if layer_indices is None:
-        layer_indices = range(tagged_scores.numel())
-    layers = list(layer_indices)
-
-    figure, axes = plt.subplots(1, 2, figsize=(12, 4))
-    projection_axis, margin_axis = axes
-
-    projection_axis.plot(layers, tagged_scores, marker="o", label="role-tag")
-    projection_axis.plot(layers, no_tag_scores, marker="o", label="no-tag")
-    projection_axis.set_xlabel("Layer")
-    projection_axis.set_ylabel("Projection onto dominant direction")
-    projection_axis.set_title("Projected class vectors")
-    projection_axis.legend()
-
-    margin_axis.axhline(0, color="black", linewidth=1)
-    margin_axis.bar(layers, margins)
-    margin_axis.set_xlabel("Layer")
-    margin_axis.set_ylabel("role-tag − no-tag projection")
-    margin_axis.set_title("Separation along dominant direction")
-
-    figure.tight_layout()
-    return figure, (projection_axis, margin_axis)
-
-
-def main() -> None:
-    import matplotlib.pyplot as plt
-
-    candidate_directions = torch.load(
-        ACTIVATION_DIR / "pca_matrix.pt", map_location="cpu"
-    ).float()
-    tagged_vectors = torch.load(ACTIVATION_DIR / "pos_act.pt", map_location="cpu")
-    no_tag_vectors = torch.load(ACTIVATION_DIR / "neg_act.pt", map_location="cpu")
-
-    normalized_directions = normalize_candidate_directions(candidate_directions)
-    _, _, components = torch.linalg.svd(normalized_directions, full_matrices=False)
-    direction = components[0]  # [hidden]
-    if torch.dot(direction, normalized_directions.mean(dim=0)) < 0:
-        direction = -direction
-
-    layers = range(7, 18)
-    figure, _ = plot_role_tag_projections(
-        tagged_vectors,
-        no_tag_vectors,
-        direction,
-        layers,
-    )
-    output_path = ACTIVATION_DIR / "role_tag_projections.png"
-    figure.savefig(output_path, dpi=150)
-    print(f"Saved projection plot to {output_path}")
-    plt.show()
-
-
-if __name__ == "__main__":
-    main()

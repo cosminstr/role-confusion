@@ -1,244 +1,111 @@
 """
-Benchmark a candidate "best" direction to see how relevant it is on this task
+compute_projection_scores: Projects activation vectors onto a candidate direction.
+plot_role_tag_projections: Plots tagged and untagged projection clouds per token and layer.
+main: Loads cached scores for tokens 0, 8, 32 and 64 and saves and shows the plots.
 """
 
-from __future__ import annotations
-
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-import modal
-import nnsight
+import matplotlib.pyplot as plt
 import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from utils import ROLES, get_first_content_positions, load_aligned_dataset, set_seed
-
-if TYPE_CHECKING:
-    import pandas as pd
+import torch.nn.functional as F
+from matplotlib.figure import Figure
 
 
-MODEL_NAME = "openai/gpt-oss-20b"
-BATCH_SIZE = 32
-LAYERS_TO_PROBE = tuple(range(24))
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = PROJECT_ROOT / "data"
-ACTIVATION_DIR = DATA_DIR / "L7_17" / "linear_separability"
-REMOTE_DATA_DIR = Path("/data")
-VOLUME_PATH = Path("/hf")
-
-app = modal.App()
-volume = modal.Volume.from_name("hf")
-hf_secret = modal.Secret.from_dotenv(PROJECT_ROOT)
-image = (
-    modal.Image.debian_slim()
-    .uv_pip_install(
-        "kernels",
-        "nnsight==0.7.0",
-        "torch==2.13.0",
-        "tqdm==4.70.0",
-        "transformers==5.15.1",
-    )
-    .env(
-        {
-            "HF_HOME": str(VOLUME_PATH),
-            "HF_XET_HIGH_PERFORMANCE": "1",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        }
-    )
-    .add_local_file(
-        DATA_DIR / "examples.pt",
-        str(REMOTE_DATA_DIR / "examples.pt"),
-    )
-    .add_local_file(
-        DATA_DIR / "counter_examples.pt",
-        str(REMOTE_DATA_DIR / "counter_examples.pt"),
-    )
-    .add_local_file(
-        ACTIVATION_DIR / "dominant_direction.pt",
-        str(REMOTE_DATA_DIR / "dominant_direction.pt"),
-    )
-    .add_local_python_source("utils")
-)
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 
-def cache_projection_scores(
-    model: nnsight.LanguageModel,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    token_positions: torch.Tensor,
+def compute_projection_scores(
+    activations: torch.Tensor,
     direction: torch.Tensor,
 ) -> torch.Tensor:
-    batch_positions = torch.arange(input_ids.size(0))[:, None]
-    direction = direction.to(device=model.device, dtype=torch.float32)
-    saved_scores = []
-    with model.trace(
-        {"input_ids": input_ids, "attention_mask": attention_mask}
-    ) as tracer:
-        for layer_index in LAYERS_TO_PROBE:
-            scores = (
-                model.model.layers[layer_index]
-                .input[batch_positions, token_positions]
-                .float()
-                @ direction
-            ).save()  # [batch, tokens]
-            saved_scores.append(scores)
-        tracer.stop()
-
-    return torch.stack(saved_scores, dim=2).detach().cpu()  # [batch, tokens, layers]
+    direction = direction.to(device=activations.device, dtype=torch.float32)  # [hidden]
+    unit_direction = F.normalize(direction, dim=0)  # [hidden]
+    activations = activations.float()  # [..., hidden]
+    scores = activations @ unit_direction  # [...]
+    return scores
 
 
-@app.function(
-    image=image,
-    gpu="H200",
-    secrets=[hf_secret],
-    timeout=60 * 60 * 24,
-    volumes={str(VOLUME_PATH): volume},
-)
-def collect_projection_scores(seed: int = 42) -> tuple[torch.Tensor, torch.Tensor]:
-    set_seed(seed)
-    model = nnsight.LanguageModel(
-        MODEL_NAME,
-        device_map="auto",
-        dtype="auto",
-        cache_dir=VOLUME_PATH,
-        dispatch=True,
-    )
-    model.set_experts_implementation("eager")
-    model.eval()
-    model.config.use_cache = False
-
-    direction = torch.load(
-        REMOTE_DATA_DIR / "dominant_direction.pt",
-        map_location="cpu",
-    )
-    dataloader = DataLoader(
-        load_aligned_dataset(REMOTE_DATA_DIR),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-    )
-    tagged_batches = []
-    raw_batches = []
-
-    for batch in tqdm(dataloader, desc="Projecting activations"):
-        (
-            example_input_ids,  # [batch, roles, tagged_length]
-            example_attention_mask,
-            counter_input_ids,  # [batch, content_length]
-            counter_attention_mask,
-        ) = batch
-        content_starts = get_first_content_positions(
-            example_input_ids,
-            example_attention_mask,
-            counter_input_ids,
-        )
-        offsets = torch.arange(counter_input_ids.size(1))
-        raw_positions = offsets[None].expand(counter_input_ids.size(0), -1)
-        raw_batches.append(
-            cache_projection_scores(
-                model,
-                counter_input_ids,
-                counter_attention_mask,
-                raw_positions,
-                direction,
-            )
-        )
-
-        role_scores = []
-        for role_index in range(len(ROLES)):
-            example_positions = content_starts[:, role_index, None] + offsets[None]
-            role_scores.append(
-                cache_projection_scores(
-                    model,
-                    example_input_ids[:, role_index],
-                    example_attention_mask[:, role_index],
-                    example_positions,
-                    direction,
-                )
-            )
-        tagged_batches.append(torch.stack(role_scores, dim=1))
-
-    tagged_scores = torch.cat(tagged_batches)  # [samples, roles, tokens, layers]
-    raw_scores = torch.cat(raw_batches)  # [samples, tokens, layers]
-    return tagged_scores, raw_scores
-
-
-def get_test_indices(n_samples: int, train_indices: torch.Tensor) -> torch.Tensor:
-    test_mask = torch.ones(n_samples, dtype=torch.bool)
-    test_mask[train_indices] = False
-    return torch.arange(n_samples)[test_mask]
-
-
-def benchmark_scores(
+def plot_role_tag_projections(
     tagged_scores: torch.Tensor,
-    raw_scores: torch.Tensor,
-    train_indices: torch.Tensor,
-) -> pd.DataFrame:
-    import pandas as pd
+    no_tag_scores: torch.Tensor,
+    token_offsets: Sequence[int],
+    layer_indices: Sequence[int],
+) -> Figure:
+    tagged_scores = tagged_scores.cpu()  # [tagged_points, tokens, layers]
+    no_tag_scores = no_tag_scores.cpu()  # [untagged_points, tokens, layers]
+    layers = list(layer_indices)
+    generator = torch.Generator().manual_seed(42)
+    figure, axes_grid = plt.subplots(2, 2, figsize=(15, 11), sharey=True)
+    axes = list(axes_grid.flat)
+    colors = ("tab:blue", "tab:orange", "tab:green", "tab:purple")
 
-    test_indices = get_test_indices(tagged_scores.size(0), train_indices)
-    test_positive = tagged_scores[test_indices].flatten(0, 1).float()
-    test_negative = raw_scores[test_indices].float()
-    tagged_high_margin = (
-        test_positive.min(dim=0).values - test_negative.max(dim=0).values
-    )
-    tagged_low_margin = (
-        test_negative.min(dim=0).values - test_positive.max(dim=0).values
-    )
-    separation_margin = torch.maximum(tagged_high_margin, tagged_low_margin)
-    token, layer = torch.meshgrid(
-        torch.arange(tagged_scores.size(2)),
-        torch.tensor(LAYERS_TO_PROBE),
-        indexing="ij",
-    )
+    for token_index, token in enumerate(token_offsets):
+        axis = axes[token_index]
+        color = colors[token_index]
+        groups = (
+            (tagged_scores, "Tagged (all six roles)", "black", "o", 9, 0.2),
+            (no_tag_scores, "Untagged", color, "x", 20, 0.7),
+        )
+        for scores, label, point_color, marker, size, alpha in groups:
+            for column, layer in enumerate(layers):
+                layer_scores = scores[:, token_index, column]  # [points]
+                jitter = torch.rand(
+                    layer_scores.size(0), generator=generator
+                )  # [points]
+                jitter = (jitter - 0.5) * 0.56  # [points]
+                vertical_positions = layer + jitter  # [points]
+                legend_label = label if column == 0 else None
+                axis.scatter(
+                    layer_scores,
+                    vertical_positions,
+                    s=size,
+                    alpha=alpha,
+                    color=point_color,
+                    marker=marker,
+                    linewidths=0.6,
+                    label=legend_label,
+                )
 
-    return pd.DataFrame(
-        {
-            "token": token.flatten().numpy(),
-            "layer": layer.flatten().numpy(),
-            "linearly_separable": (separation_margin > 0).flatten().numpy(),
-        }
+        axis.axvline(0, color="gray", linewidth=0.8, linestyle="--")
+        axis.set_yticks(layers)
+        axis.set_xlabel("Signed projection onto cached direction")
+        axis.set_ylabel("Layer")
+        axis.set_title(f"Content-token offset {token}", color=color)
+        axis.legend(loc="best")
+        axis.grid(axis="y", alpha=0.2)
+        axis.set_axisbelow(True)
+
+    figure.suptitle(
+        "Individual activation projections · all prompts\n"
+        "Vertical jitter separates points; each panel has its own x-axis scale"
     )
-
-
-def plot_heatmap(results: pd.DataFrame, output_path: Path) -> None:
-    import matplotlib.pyplot as plt
-
-    figure, axis = plt.subplots(figsize=(18, 4))
-    values = results.pivot(index="layer", columns="token", values="linearly_separable")
-    image = axis.imshow(
-        values.astype(float),
-        vmin=0.0,
-        vmax=1.0,
-        aspect="auto",
-        cmap="viridis",
-    )
-    axis.set_xlabel("Content-token offset")
-    axis.set_ylabel("Layer")
-    axis.set_title("Exact linear separability on held-out projections")
-    figure.colorbar(image, ax=axis)
     figure.tight_layout()
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
+    return figure
 
 
-@app.local_entrypoint()
-def main(seed: int = 42) -> None:
-    tagged_scores, raw_scores = collect_projection_scores.remote(seed)
-    train_indices = torch.load(
-        ACTIVATION_DIR / "train_indices.pt",
-        map_location="cpu",
+def main() -> None:
+    scores_path = DATA_DIR / "L7_17" / "linear_separability_2" / "projection_scores.pt"
+    scores = torch.load(scores_path, map_location="cpu")
+    layers = range(7, 18)
+    token_offsets = (0, 8, 32, 64)
+    tagged_scores = scores["tagged"][
+        :, :, token_offsets, 7:18
+    ]  # [samples, roles, tokens, layers]
+    tagged_scores = tagged_scores.flatten(0, 1)  # [tagged_points, tokens, layers]
+    no_tag_scores = scores["raw"][:, token_offsets, 7:18]  # [samples, tokens, layers]
+    figure = plot_role_tag_projections(
+        tagged_scores,
+        no_tag_scores,
+        token_offsets,
+        layers,
     )
-    results = benchmark_scores(tagged_scores, raw_scores, train_indices)
+    # output_path = DATA_DIR / "difference_in_means" / "role_tag_projection_clouds.png"
+    # figure.savefig(output_path, dpi=150)
+    # print(f"Saved projection plot to {output_path}")
+    plt.show()
 
-    csv_path = ACTIVATION_DIR / "linear_separability_3.csv"
-    heatmap_path = ACTIVATION_DIR / "linear_separability_heatmap_3.png"
-    results.to_csv(csv_path, index=False)
-    plot_heatmap(results, heatmap_path)
 
-    print(
-        f"Exactly separable held-out layer/token pairs: "
-        f"{results['linearly_separable'].sum()} / {len(results)}"
-    )
-    print(f"Saved exact linear separability metrics to {csv_path}")
-    print(f"Saved exact linear separability heatmap to {heatmap_path}")
+if __name__ == "__main__":
+    main()
