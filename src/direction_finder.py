@@ -1,5 +1,5 @@
 from pathlib import Path
-
+import os
 import modal
 import nnsight
 import torch
@@ -155,19 +155,30 @@ def build_pca_matrix(
 
 
 @app.local_entrypoint()
-def main(seed: int = 42) -> None:
+def main(working_dir: str, seed: int = 42) -> None:
+    if not os.path.exists(DATA_DIR / working_dir):
+        raise FileNotFoundError(
+            f"Directory {str(DATA_DIR / working_dir)} does not exist"
+        )
+
     pca_matrix, direction, positive_activations, negative_activations, train_indices = (
         build_pca_matrix.remote(seed)
     )
-    output_path = DATA_DIR / "L7_17" / "pca_matrix.pt"
+    output_path = DATA_DIR / working_dir / "pca_matrix.pt"
     torch.save(pca_matrix, output_path)
-    direction_path = DATA_DIR / "L7_17" / "dominant_direction.pt"
+    direction_path = DATA_DIR / working_dir / "dominant_direction.pt"
     torch.save(direction, direction_path)
-    train_indices_path = DATA_DIR / "L7_17" / "train_indices.pt"
+    train_indices_path = DATA_DIR / working_dir / "train_indices.pt"
     torch.save(train_indices, train_indices_path)
-    print(f"Saved candidate direction matrix with shape {tuple(pca_matrix.shape)} to {output_path}")
-    print(f"Saved dominant direction with shape {tuple(direction.shape)} to {direction_path}")
-    print(f"Saved {train_indices.numel()} direction-training indices to {train_indices_path}")
+    print(
+        f"Saved candidate direction matrix with shape {tuple(pca_matrix.shape)} to {output_path}"
+    )
+    print(
+        f"Saved dominant direction with shape {tuple(direction.shape)} to {direction_path}"
+    )
+    print(
+        f"Saved {train_indices.numel()} direction-training indices to {train_indices_path}"
+    )
 
     print("Checking activations")
     torch.save(positive_activations, DATA_DIR / "L7_17" / "pos_act.pt")
