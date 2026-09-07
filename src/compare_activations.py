@@ -1,4 +1,13 @@
+"""
+Compare activation vectors used to compute the candidate directions.
+
+Pass a --activations-dir argument to choose what activation vectors to compare
+
+e.g. uv run src/compare_activations.py --activations_dir L7_17
+"""
+
 import torch
+import argparse
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
@@ -33,9 +42,13 @@ def compare_act(x: torch.Tensor, y: torch.Tensor):
 # Load activations
 # ============================================================
 
-x = torch.load(DATA_DIR / "difference_in_means" / "pos_act.pt").float()
+parser = argparse.ArgumentParser("compare_activations")
+parser.add_argument("--activations_dir", type=str, required=True)
+args = parser.parse_args()
 
-y = torch.load(DATA_DIR / "difference_in_means" / "neg_act.pt").float()
+x = torch.load(DATA_DIR / args.activations_dir / "pos_act.pt").float()
+
+y = torch.load(DATA_DIR / args.activations_dir / "neg_act.pt").float()
 
 if x.ndim == 2:
     x = x.unsqueeze(0)  # [1, layers, hidden]

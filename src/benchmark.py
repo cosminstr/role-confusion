@@ -1,3 +1,7 @@
+"""
+Benchmark a candidate "best" direction to see how relevant it is on this task
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

@@ -1,3 +1,11 @@
+"""
+One time use. It generates torch tensors inside data/ of size [N, R, LEN] and [N, LEN]
+where N is N_SAMPLES, R is number of roles and LEN is MAX_SEQ_LEN or the max padded seq len for the
+role-enhanced prompts.
+
+The tensors are later used with load_aligned_datasets from inside src/utils.py
+"""
+
 from pathlib import Path
 from typing import Any
 

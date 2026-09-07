@@ -1,3 +1,17 @@
+"""
+This script contains utilitary methods.
+
+set_seed: Seeds PyTorch and CUDA for reproducible runs.
+load_aligned_dataset: Loads tagged and untagged prompts into one aligned dataset.
+get_first_content_positions: Finds where the shared content starts in each tagged prompt.
+cache_layer_inputs: Caches layer input activations at selected token positions.
+normalize_candidate_directions: Normalizes each row of the candidate-direction matrix.
+split_prompt_indices: Splits shuffled prompt indices into training and held-out sets.
+project_onto_direction: Projects vectors onto a normalized direction.
+plot_role_tag_projections: Plots tagged and untagged projections and their differences.
+main: Computes the dominant direction from saved data and saves and shows the projection plot.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -82,11 +96,14 @@ def cache_layer_inputs(
             saved_activations.append(activation)
         tracer.stop()
 
-    return torch.stack(saved_activations, dim=1).detach().cpu()  # [batch, layers, hidden]
+    return (
+        torch.stack(saved_activations, dim=1).detach().cpu()
+    )  # [batch, layers, hidden]
 
 
 def normalize_candidate_directions(matrix: torch.Tensor) -> torch.Tensor:
     return F.normalize(matrix.float(), dim=1)  # [candidates, hidden]
+    # normalizes the rows.
 
 
 def split_prompt_indices(
@@ -98,6 +115,11 @@ def split_prompt_indices(
     permutation = torch.randperm(n_samples, generator=generator)
     split = int(train_fraction * n_samples)
     return permutation[:split], permutation[split:]
+
+
+############################
+# Used only in this script #
+############################
 
 
 def project_onto_direction(
@@ -150,12 +172,8 @@ def main() -> None:
     candidate_directions = torch.load(
         ACTIVATION_DIR / "pca_matrix.pt", map_location="cpu"
     ).float()
-    tagged_vectors = torch.load(
-        ACTIVATION_DIR / "pos_act.pt", map_location="cpu"
-    )
-    no_tag_vectors = torch.load(
-        ACTIVATION_DIR / "neg_act.pt", map_location="cpu"
-    )
+    tagged_vectors = torch.load(ACTIVATION_DIR / "pos_act.pt", map_location="cpu")
+    no_tag_vectors = torch.load(ACTIVATION_DIR / "neg_act.pt", map_location="cpu")
 
     normalized_directions = normalize_candidate_directions(candidate_directions)
     _, _, components = torch.linalg.svd(normalized_directions, full_matrices=False)
