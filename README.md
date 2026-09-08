@@ -8,7 +8,7 @@ Run from `role-confusion/`. Requires `uv sync`, Modal authentication, the `hf`
 Modal Volume, and `.env`. Both Modal scripts use an H200; plotting runs locally.
 All optional arguments default to `src/config.py`; only the run directories are required.
 
-### 1. Generate datasets (skip if already present)
+### 1. Generate datasets
 
 ```bash
 uv run python src/dataset.py --n-samples 256 --max-seq-len 512 --seed 42
@@ -19,7 +19,7 @@ uv run python src/dataset.py --n-samples 256 --max-seq-len 512 --seed 42
 - `--model-name`: tokenizer (default `openai/gpt-oss-20b`); role formatting remains GPT-OSS-specific.
 - C4 options: `--dataset-name`, `--dataset-subset`, `--dataset-split`, `--shuffle-buffer`.
 
-### 2. Find the direction (skip if already available)
+### 2. Find the direction
 
 ```bash
 uv run modal run src/direction_finder.py --working-dir L7_17
