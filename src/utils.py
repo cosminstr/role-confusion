@@ -42,6 +42,8 @@ def set_seed(seed: int = SEED) -> None:
 @contextmanager
 def uploaded_dataset(data_dir: str | Path) -> Iterator[modal.Volume]:
     data_dir = Path(data_dir)
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Directory {data_dir} does not exist")
     with modal.Volume.ephemeral() as volume:
         with volume.batch_upload() as upload:
             upload.put_file(data_dir / "examples.pt", "/examples.pt")

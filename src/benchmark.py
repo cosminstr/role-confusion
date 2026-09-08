@@ -199,6 +199,8 @@ def main(
         data_dir=str(Path(data_dir).resolve()),
     )
     direction_dir = settings.DATA_DIR / config.activations_dir
+    if not direction_dir.is_dir():
+        raise FileNotFoundError(f"Directory {direction_dir} does not exist")
     direction = torch.load(direction_dir / "dominant_direction.pt", map_location="cpu")
     with uploaded_dataset(config.data_dir) as inputs:
         remote = get_sequence_scores.with_options(volumes={

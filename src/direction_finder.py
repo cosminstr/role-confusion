@@ -158,7 +158,8 @@ def main(
         data_dir=str(Path(data_dir).resolve()),
     )
     output_dir = settings.DATA_DIR / config.working_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not output_dir.is_dir():
+        raise FileNotFoundError(f"Directory {output_dir} does not exist")
     with uploaded_dataset(config.data_dir) as inputs:
         remote = build_pca_matrix.with_options(volumes={
             str(settings.VOLUME_PATH): volume,
