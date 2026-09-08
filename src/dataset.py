@@ -1,11 +1,4 @@
-"""
-One time use. It generates torch tensors inside data/ of size [N, R, LEN] and [N, LEN]
-where N is N_SAMPLES, R is number of roles and LEN is MAX_SEQ_LEN or the max padded seq len for the
-role-enhanced prompts.
-
-The tensors are later used with load_aligned_datasets from inside src/utils.py
-"""
-
+import argparse
 from pathlib import Path
 from typing import Any
 
@@ -13,20 +6,16 @@ import torch
 from datasets import IterableDataset, load_dataset
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer
-from utils import ROLES
+from config import DatasetConfig, PROJECT_ROOT, ROLES, save_config
 
 
-N_SAMPLES = 256
-MAX_SEQ_LEN = 512
-
-
-def get_c4(seed: int = 42) -> IterableDataset:
+def get_c4(config: DatasetConfig) -> IterableDataset:
     return load_dataset(
-        "allenai/c4",
-        "en",
-        split="validation",
+        config.dataset_name,
+        config.dataset_subset,
+        split=config.dataset_split,
         streaming=True,
-    ).shuffle(seed=seed, buffer_size=50_000)
+    ).shuffle(seed=config.seed, buffer_size=config.shuffle_buffer)
 
 
 def render_single_role_gptoss(role: str, content: str) -> str:
@@ -47,7 +36,7 @@ def render_single_role_gptoss(role: str, content: str) -> str:
 def is_long_c4_sample(
     sample: dict[str, str],
     tokenizer: Any,
-    max_seq_len: int = 512,
+    max_seq_len: int = DatasetConfig.max_seq_len,
 ) -> bool:
     input_ids = tokenizer(
         sample["text"],
@@ -127,37 +116,32 @@ def build_sample_seqs(
 
 def get_role_probe_dataset(
     tokenizer: Any,
-    n_samples: int = N_SAMPLES,
-    max_seq_len: int = MAX_SEQ_LEN,
-    seed: int = 42,
+    config: DatasetConfig,
 ) -> IterableDataset:
     c4 = (
-        get_c4(seed)
+        get_c4(config)
         .select_columns(["text"])
         .filter(
             is_long_c4_sample,
-            fn_kwargs={"tokenizer": tokenizer, "max_seq_len": max_seq_len},
+            fn_kwargs={"tokenizer": tokenizer, "max_seq_len": config.max_seq_len},
         )
-        .take(n_samples)
+        .take(config.n_samples)
     )
     return c4.map(
         build_sample_seqs,
         batched=True,
-        batch_size=n_samples,
+        batch_size=config.n_samples,
         with_indices=True,
         remove_columns=["text"],
-        fn_kwargs={"tokenizer": tokenizer, "max_seq_len": max_seq_len},
+        fn_kwargs={"tokenizer": tokenizer, "max_seq_len": config.max_seq_len},
     )
 
 
 def write_c4_role_datasets(
     tokenizer: Any,
-    n_samples: int = N_SAMPLES,
-    max_seq_len: int = MAX_SEQ_LEN,
-    seed: int = 42,
-    data_dir: str | Path = Path(__file__).resolve().parents[1] / "data",
+    config: DatasetConfig,
 ) -> tuple[Path, Path]:
-    samples = list(get_role_probe_dataset(tokenizer, n_samples, max_seq_len, seed))
+    samples = list(get_role_probe_dataset(tokenizer, config))
     role_samples = [
         [
             torch.tensor(
@@ -182,11 +166,11 @@ def write_c4_role_datasets(
         add_special_tokens=False,
         padding="max_length",
         truncation=True,
-        max_length=max_seq_len,
+        max_length=config.max_seq_len,
         return_tensors="pt",
     )
 
-    data_dir = Path(data_dir)
+    data_dir = Path(config.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     examples_path = data_dir / "examples.pt"
     counter_examples_path = data_dir / "counter_examples.pt"
@@ -200,6 +184,7 @@ def write_c4_role_datasets(
         },
         counter_examples_path,
     )
+    save_config(config, data_dir / "dataset_config.json")
 
     return examples_path, counter_examples_path
 
@@ -208,7 +193,7 @@ def sanity_check(
     tokenizer: Any,
     examples_path: str | Path,
     counter_examples_path: str | Path,
-    output_path: str | Path = Path(__file__).resolve().parents[1] / "tmp.txt",
+    output_path: str | Path = PROJECT_ROOT / "tmp.txt",
 ) -> Path:
     examples = torch.load(examples_path, map_location="cpu")
     print(examples.keys())
@@ -240,14 +225,22 @@ def sanity_check(
 
 
 def main() -> None:
-    tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")
-    # write_c4_role_datasets(tokenizer)
-
-    sanity_check(
-        tokenizer,
-        "data/examples.pt",
-        "data/counter_examples.pt",
-    )
+    parser = argparse.ArgumentParser("Generate aligned role datasets")
+    parser.add_argument("--model-name", default=DatasetConfig.model_name)
+    parser.add_argument("--data-dir", default=DatasetConfig.data_dir)
+    parser.add_argument("--n-samples", type=int, default=DatasetConfig.n_samples)
+    parser.add_argument("--max-seq-len", type=int, default=DatasetConfig.max_seq_len)
+    parser.add_argument("--seed", type=int, default=DatasetConfig.seed)
+    parser.add_argument("--dataset-name", default=DatasetConfig.dataset_name)
+    parser.add_argument("--dataset-subset", default=DatasetConfig.dataset_subset)
+    parser.add_argument("--dataset-split", default=DatasetConfig.dataset_split)
+    parser.add_argument("--shuffle-buffer", type=int, default=DatasetConfig.shuffle_buffer)
+    args = parser.parse_args()
+    config = DatasetConfig(**vars(args))
+    config.data_dir = str(Path(config.data_dir).resolve())
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    examples_path, counter_examples_path = write_c4_role_datasets(tokenizer, config)
+    print(f"Saved datasets to {examples_path} and {counter_examples_path}")
 
 
 if __name__ == "__main__":

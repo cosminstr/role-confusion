@@ -1,10 +1,11 @@
 from pathlib import Path
-import os
 import modal
 import nnsight
 import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
+import config as settings
+from config import DirectionConfig, parse_indices, save_config
 from utils import (
     cache_layer_inputs,
     get_first_content_positions,
@@ -12,45 +13,18 @@ from utils import (
     normalize_candidate_directions,
     set_seed,
     split_prompt_indices,
+    uploaded_dataset,
 )
 
 
-MODEL_NAME = "openai/gpt-oss-20b"
-BATCH_SIZE = 32
-LAYERS_TO_PROBE = list(range(7, 18, 1))
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = PROJECT_ROOT / "data"
-REMOTE_DATA_DIR = Path("/data")
-VOLUME_PATH = Path("/hf")
-
 app = modal.App()
-volume = modal.Volume.from_name("hf")
-hf_secret = modal.Secret.from_dotenv(PROJECT_ROOT)
+volume = modal.Volume.from_name(settings.VOLUME_NAME)
+hf_secret = modal.Secret.from_dotenv(settings.PROJECT_ROOT)
 image = (
     modal.Image.debian_slim()
-    .uv_pip_install(
-        "kernels",
-        "nnsight==0.7.0",
-        "torch==2.13.0",
-        "tqdm==4.70.0",
-        "transformers==5.15.1",
-    )
-    .env(
-        {
-            "HF_HOME": str(VOLUME_PATH),
-            "HF_XET_HIGH_PERFORMANCE": "1",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        }
-    )
-    .add_local_file(
-        DATA_DIR / "examples.pt",
-        str(REMOTE_DATA_DIR / "examples.pt"),
-    )
-    .add_local_file(
-        DATA_DIR / "counter_examples.pt",
-        str(REMOTE_DATA_DIR / "counter_examples.pt"),
-    )
-    .add_local_python_source("utils")
+    .uv_pip_install(*settings.IMAGE_PACKAGES)
+    .env(settings.IMAGE_ENV)
+    .add_local_python_source("utils", "config")
 )
 
 
@@ -64,38 +38,39 @@ def compute_dominant_direction(matrix: torch.Tensor) -> torch.Tensor:
     return direction
 
 
-def load_dataloader(seed: int) -> tuple[DataLoader, torch.Tensor]:
-    dataset = load_aligned_dataset(REMOTE_DATA_DIR)
-    train_indices, _ = split_prompt_indices(len(dataset), seed)
+def load_dataloader(config: DirectionConfig) -> tuple[DataLoader, torch.Tensor]:
+    dataset = load_aligned_dataset(settings.REMOTE_DATA_DIR)
+    train_indices, _ = split_prompt_indices(len(dataset), config.seed, config.train_fraction)
     train_dataset = Subset(dataset, train_indices.tolist())
     return (
-        DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False),
+        DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False),
         train_indices,
     )
 
 
 @app.function(
     image=image,
-    gpu="H200",
+    gpu=settings.GPU,
     secrets=[hf_secret],
-    timeout=60 * 60 * 24,
-    volumes={str(VOLUME_PATH): volume},
+    timeout=settings.TIMEOUT,
+    volumes={str(settings.VOLUME_PATH): volume},
 )
 def build_pca_matrix(
-    seed: int = 42,
+    config: DirectionConfig,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    set_seed(seed)
+    set_seed(config.seed)
+    layer_indices = parse_indices(config.layers)
     model = nnsight.LanguageModel(
-        MODEL_NAME,
-        device_map="auto",
-        dtype="auto",
-        cache_dir=VOLUME_PATH,
+        config.model_name,
+        device_map=settings.MODEL_DEVICE_MAP,
+        dtype=settings.MODEL_DTYPE,
+        cache_dir=settings.VOLUME_PATH,
         dispatch=True,
     )
-    model.set_experts_implementation("eager")  # for reproductibility
+    model.set_experts_implementation(settings.EXPERTS_IMPLEMENTATION)  # for reproductibility
     model.eval()
-    model.config.use_cache = False
-    dataloader, train_indices = load_dataloader(seed)
+    model.config.use_cache = settings.USE_CACHE
+    dataloader, train_indices = load_dataloader(config)
     example_activation_sum = None
     counter_activation_sum = None
     example_prompt_count = 0
@@ -112,15 +87,19 @@ def build_pca_matrix(
             example_input_ids,
             example_attention_mask,
             counter_input_ids,
+            window_size=config.window_size,
+            token_start=config.token_start,
         )
-        counter_positions = torch.zeros_like(counter_input_ids[:, 0])  # [batch]
+        offsets = torch.arange(config.token_start, config.token_start + config.window_size)  # [window]
+        counter_positions = offsets.unsqueeze(0).expand(counter_input_ids.size(0), -1)  # [batch, window]
         counter_batch_activations = cache_layer_inputs(
             model,
             counter_input_ids,
             counter_attention_mask,
             counter_positions,
-            LAYERS_TO_PROBE,
-        )  # [batch, layers, hidden]
+            layer_indices,
+        )  # [batch, layers, window, hidden]
+        counter_batch_activations = counter_batch_activations.mean(dim=2)  # [batch, layers, hidden]
         counter_batch_sum = counter_batch_activations.sum(dim=0)  # [layers, hidden]
         if counter_activation_sum is None:
             counter_activation_sum = torch.zeros_like(counter_batch_sum)
@@ -133,8 +112,9 @@ def build_pca_matrix(
                 example_input_ids[:, role_index],
                 example_attention_mask[:, role_index],
                 example_positions[:, role_index],
-                LAYERS_TO_PROBE,
-            )  # [batch, layers, hidden]
+                layer_indices,
+            )  # [batch, layers, window, hidden]
+            example_batch_activations = example_batch_activations.mean(dim=2)  # [batch, layers, hidden]
             example_activation_sum += example_batch_activations.sum(dim=0)
 
         counter_prompt_count += counter_input_ids.size(0)
@@ -155,21 +135,44 @@ def build_pca_matrix(
 
 
 @app.local_entrypoint()
-def main(working_dir: str, seed: int = 42) -> None:
-    if not os.path.exists(DATA_DIR / working_dir):
-        raise FileNotFoundError(
-            f"Directory {str(DATA_DIR / working_dir)} does not exist"
-        )
-
-    pca_matrix, direction, positive_activations, negative_activations, train_indices = (
-        build_pca_matrix.remote(seed)
+def main(
+    working_dir: str,
+    seed: int = DirectionConfig.seed,
+    model_name: str = DirectionConfig.model_name,
+    batch_size: int = DirectionConfig.batch_size,
+    layers: str = DirectionConfig.layers,
+    token_start: int = DirectionConfig.token_start,
+    window_size: int = DirectionConfig.window_size,
+    train_fraction: float = DirectionConfig.train_fraction,
+    data_dir: str = DirectionConfig.data_dir,
+) -> None:
+    config = DirectionConfig(
+        working_dir=working_dir,
+        seed=seed,
+        model_name=model_name,
+        batch_size=batch_size,
+        layers=layers,
+        token_start=token_start,
+        window_size=window_size,
+        train_fraction=train_fraction,
+        data_dir=str(Path(data_dir).resolve()),
     )
-    output_path = DATA_DIR / working_dir / "pca_matrix.pt"
+    output_dir = settings.DATA_DIR / config.working_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with uploaded_dataset(config.data_dir) as inputs:
+        remote = build_pca_matrix.with_options(volumes={
+            str(settings.VOLUME_PATH): volume,
+            str(settings.REMOTE_DATA_DIR): inputs,
+        })
+        pca_matrix, direction, positive_activations, negative_activations, train_indices = remote.remote(config)
+
+    output_path = output_dir / "pca_matrix.pt"
     torch.save(pca_matrix, output_path)
-    direction_path = DATA_DIR / working_dir / "dominant_direction.pt"
+    direction_path = output_dir / "dominant_direction.pt"
     torch.save(direction, direction_path)
-    train_indices_path = DATA_DIR / working_dir / "train_indices.pt"
+    train_indices_path = output_dir / "train_indices.pt"
     torch.save(train_indices, train_indices_path)
+    save_config(config, output_dir / "direction_config.json")
     print(
         f"Saved candidate direction matrix with shape {tuple(pca_matrix.shape)} to {output_path}"
     )
@@ -181,6 +184,6 @@ def main(working_dir: str, seed: int = 42) -> None:
     )
 
     print("Checking activations")
-    torch.save(positive_activations, DATA_DIR / "L7_17" / "pos_act.pt")
-    torch.save(negative_activations, DATA_DIR / "L7_17" / "neg_act.pt")
+    torch.save(positive_activations, output_dir / "pos_act.pt")
+    torch.save(negative_activations, output_dir / "neg_act.pt")
     print(positive_activations.size(), negative_activations.size())
