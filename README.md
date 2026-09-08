@@ -22,10 +22,11 @@ uv run python src/dataset.py --n-samples 256 --max-seq-len 512 --seed 42
 ### 2. Find the direction
 
 ```bash
+mkdir -p data/L7_17
 uv run modal run src/direction_finder.py --working-dir L7_17
 ```
 
-- `--working-dir`: output folder under `data/` (created automatically), or an absolute path.
+- `--working-dir`: existing output folder under `data/`, or an absolute path; missing directories raise an error.
 - `--layers`: `7:18` by default; lists (`7,10,17`) and ranges (`7:18:2`) work; stop is exclusive.
 - `--token-start`: first content offset (0); `--window-size`: token count (1).
 - Multiple tokens are averaged per layer before computing the direction.
